@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,45 +42,95 @@ import (
 // Applier prepares manifests depending on the available options and applies
 // them to the Kubernetes cluster.
 type Applier struct {
-	NamespaceLabels map[string]string
-	// ValidUniqueListenerPorts maps each listener port of each Gateway in the
-	// manifests to a valid, unique port. There must be as many
-	// ValidUniqueListenerPorts as there are listeners in the set of manifests.
-	// For example, given two Gateways, each with 2 listeners, there should be
-	// four ValidUniqueListenerPorts.
-	// If empty or nil, ports are not modified.
-	ValidUniqueListenerPorts []v1alpha2.PortNumber
+	namespaceLabels map[string]string
+	// availablePorts holds ports that can still be assigned
+	availablePorts PortSet
+	// assignedPorts tracks ports used for Gateway objects
+	assignedPorts map[types.NamespacedName]PortSet
+	portsLock     sync.Mutex
+}
+
+// NewApplier creates a new Applier object.
+// validPorts should contain a list of valid ports for Gateway listeners.
+// There must be as many validPorts as the maximum number of ports
+// used simultaneously.
+// For example, given one Gateway with 2 listeners on the same port and one
+// Gateway with 2 listeners on different ports, there should be at least three
+// validPorts.
+// If empty or nil, Gateway listener ports are not modified.
+func NewApplier(namespaceLabels map[string]string, validPorts []v1alpha2.PortNumber) *Applier {
+	return &Applier{
+		namespaceLabels: namespaceLabels,
+		availablePorts:  validPorts,
+		assignedPorts:   map[types.NamespacedName]PortSet{},
+	}
+}
+
+// freePortsFor is used to mark ports used by a Gateway as available. It does
+// not lock the availablePorts map.
+func (a *Applier) freePortsFor(name types.NamespacedName) {
+	ports, ok := a.assignedPorts[name]
+	if !ok {
+		return
+	}
+	for _, port := range ports {
+		a.availablePorts = append(a.availablePorts, port)
+	}
+	delete(a.assignedPorts, name)
 }
 
 // prepareGateway adjusts both listener ports and the gatewayClassName. It
-// returns an index pointing to the next valid listener port.
-func prepareGateway(t *testing.T, uObj *unstructured.Unstructured, gatewayClassName string, validListenerPorts []v1alpha2.PortNumber, portIndex int) int {
+// returns the ports used by the listeners if they came from validPorts.
+func (a *Applier) prepareGateway(t *testing.T, uObj *unstructured.Unstructured, gatewayClassName string) {
+	name := types.NamespacedName{
+		Namespace: uObj.GetNamespace(),
+		Name:      uObj.GetName(),
+	}
+	a.freePortsFor(name)
+
 	err := unstructured.SetNestedField(uObj.Object, gatewayClassName, "spec", "gatewayClassName")
 	require.NoErrorf(t, err, "error setting `spec.gatewayClassName` on %s Gateway resource", uObj.GetName())
 
-	if len(validListenerPorts) > 0 {
-		listeners, _, err := unstructured.NestedSlice(uObj.Object, "spec", "listeners")
+	var allocatedPorts []v1alpha2.PortNumber
+
+	if len(a.availablePorts) > 0 {
+		uListeners, _, err := unstructured.NestedSlice(uObj.Object, "spec", "listeners")
 		require.NoErrorf(t, err, "error getting `spec.listeners` on %s Gateway resource", uObj.GetName())
 
-		for i, uListener := range listeners {
-			require.Less(t, portIndex, len(validListenerPorts), "not enough unassigned valid ports for `spec.listeners[%d]` on %s Gateway resource", i, uObj.GetName())
-
+		var listeners []interface{}
+		newPorts := map[int64]v1alpha2.PortNumber{}
+		for i, uListener := range uListeners {
 			listener, ok := uListener.(map[string]interface{})
 			require.Truef(t, ok, "unexpected type at `spec.listeners[%d]` on %s Gateway resource", i, uObj.GetName())
 
-			nextPort := validListenerPorts[portIndex]
-			err = unstructured.SetNestedField(listener, int64(nextPort), "port")
-			require.NoErrorf(t, err, "error setting `spec.listeners[%d].port` on %s Gateway resource", i, uObj.GetName())
+			port, _, portErr := unstructured.NestedInt64(listener, "port")
+			require.NoErrorf(t, portErr, "error getting `spec.listeners[%d].port` on %s Gateway resource", i, uObj.GetName())
 
-			portIndex++
-			listeners[i] = listener
+			// For each listener port either allocate a new port or use the port
+			// already allocated for this listener port
+			newPort, ok := newPorts[port]
+			if !ok {
+				var portIsValid bool
+				newPort, portIsValid = a.availablePorts.AssignAvailablePort()
+				require.True(t, portIsValid, "not enough unassigned valid ports for Gateway resource")
+				newPorts[port] = newPort
+			}
+
+			portErr = unstructured.SetNestedField(listener, int64(newPort), "port")
+			require.NoErrorf(t, portErr, "error setting `spec.listeners[%d].port` on %s Gateway resource", i, uObj.GetName())
+
+			listeners = append(listeners, listener)
+		}
+
+		for _, port := range newPorts {
+			allocatedPorts = append(allocatedPorts, port)
 		}
 
 		err = unstructured.SetNestedSlice(uObj.Object, listeners, "spec", "listeners")
 		require.NoErrorf(t, err, "error setting `spec.listeners` on %s Gateway resource", uObj.GetName())
 	}
 
-	return portIndex
+	a.assignedPorts[name] = allocatedPorts
 }
 
 // prepareNamespace adjusts the Namespace labels.
@@ -104,12 +155,10 @@ func prepareNamespace(t *testing.T, uObj *unstructured.Unstructured, namespaceLa
 
 // prepareResources uses the options from an Applier to tweak resources given by
 // a set of manifests.
-func (a Applier) prepareResources(t *testing.T, decoder *yaml.YAMLOrJSONDecoder, gcName string) ([]unstructured.Unstructured, error) {
+func (a *Applier) prepareResources(t *testing.T, decoder *yaml.YAMLOrJSONDecoder, gcName string) ([]unstructured.Unstructured, error) {
 	var resources []unstructured.Unstructured
-
-	// portIndex is incremented for each listener we see. For a manifest file
-	// with 2 gateways, each with 2 listeners, it will be incremented 4 times.
-	portIndex := 0
+	a.portsLock.Lock()
+	defer a.portsLock.Unlock()
 
 	for {
 		uObj := unstructured.Unstructured{}
@@ -124,11 +173,11 @@ func (a Applier) prepareResources(t *testing.T, decoder *yaml.YAMLOrJSONDecoder,
 		}
 
 		if uObj.GetKind() == "Gateway" {
-			portIndex = prepareGateway(t, &uObj, gcName, a.ValidUniqueListenerPorts, portIndex)
+			a.prepareGateway(t, &uObj, gcName)
 		}
 
 		if uObj.GetKind() == "Namespace" && uObj.GetObjectKind().GroupVersionKind().Group == "" {
-			prepareNamespace(t, &uObj, a.NamespaceLabels)
+			prepareNamespace(t, &uObj, a.namespaceLabels)
 		}
 
 		resources = append(resources, uObj)
@@ -137,7 +186,7 @@ func (a Applier) prepareResources(t *testing.T, decoder *yaml.YAMLOrJSONDecoder,
 	return resources, nil
 }
 
-func (a Applier) MustApplyObjectsWithCleanup(t *testing.T, c client.Client, resources []client.Object, cleanup bool) {
+func (a *Applier) MustApplyObjectsWithCleanup(t *testing.T, c client.Client, resources []client.Object, cleanup bool) {
 	for _, resource := range resources {
 		resource := resource
 
@@ -168,13 +217,14 @@ func (a Applier) MustApplyObjectsWithCleanup(t *testing.T, c client.Client, reso
 // MustApplyWithCleanup creates or updates Kubernetes resources defined with the
 // provided YAML file and registers a cleanup function for resources it created.
 // Note that this does not remove resources that already existed in the cluster.
-func (a Applier) MustApplyWithCleanup(t *testing.T, c client.Client, location string, gcName string, cleanup bool) {
+func (a *Applier) MustApplyWithCleanup(t *testing.T, c client.Client, location string, gcName string, cleanup bool) {
 	data, err := getContentsFromPathOrURL(location)
 	require.NoError(t, err)
 
 	decoder := yaml.NewYAMLOrJSONDecoder(data, 4096)
 
 	resources, err := a.prepareResources(t, decoder, gcName)
+
 	if err != nil {
 		t.Logf("manifest: %s", data.String())
 		require.NoErrorf(t, err, "error parsing manifest")
@@ -204,6 +254,9 @@ func (a Applier) MustApplyWithCleanup(t *testing.T, c client.Client, location st
 					t.Logf("Deleting %s %s", uObj.GetName(), uObj.GetKind())
 					err = c.Delete(ctx, uObj)
 					require.NoErrorf(t, err, "error deleting resource")
+					a.portsLock.Lock()
+					a.freePortsFor(namespacedName)
+					a.portsLock.Unlock()
 				})
 			}
 			continue
@@ -220,6 +273,9 @@ func (a Applier) MustApplyWithCleanup(t *testing.T, c client.Client, location st
 				t.Logf("Deleting %s %s", uObj.GetName(), uObj.GetKind())
 				err = c.Delete(ctx, uObj)
 				require.NoErrorf(t, err, "error deleting resource")
+				a.portsLock.Lock()
+				a.freePortsFor(namespacedName)
+				a.portsLock.Unlock()
 			})
 		}
 		require.NoErrorf(t, err, "error updating resource")
