@@ -64,7 +64,7 @@ type ConformanceTestSuite struct {
 	Debug             bool
 	Cleanup           bool
 	BaseManifests     string
-	Applier           kubernetes.Applier
+	Applier           *kubernetes.Applier
 	ExemptFeatures    []ExemptFeature
 	SupportedFeatures []SupportedFeature
 	TimeoutConfig     config.TimeoutConfig
@@ -110,10 +110,10 @@ func New(s Options) *ConformanceTestSuite {
 		Debug:            s.Debug,
 		Cleanup:          s.CleanupBaseResources,
 		BaseManifests:    s.BaseManifests,
-		Applier: kubernetes.Applier{
-			NamespaceLabels:          s.NamespaceLabels,
-			ValidUniqueListenerPorts: s.ValidUniqueListenerPorts,
-		},
+		Applier: kubernetes.NewApplier(
+			s.NamespaceLabels,
+			s.ValidUniqueListenerPorts,
+		),
 		ExemptFeatures:    s.ExemptFeatures,
 		SupportedFeatures: s.SupportedFeatures,
 		TimeoutConfig:     s.TimeoutConfig,
