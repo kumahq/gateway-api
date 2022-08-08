@@ -62,7 +62,9 @@ type Applier struct {
 	availablePorts PortSet
 	// assignedPorts tracks ports used for Gateway objects
 	assignedPorts map[types.NamespacedName]PortSet
-	portsLock     sync.Mutex
+	// portsLock is used for the critical section around freeing and assigning
+	// ports to Gateway listeners.
+	portsLock sync.Mutex
 }
 
 // NewApplier creates a new Applier object.
@@ -98,6 +100,8 @@ func (a *Applier) markPortsAvailable(name types.NamespacedName) {
 // prepareGateway adjusts both listener ports and the gatewayClassName. It
 // returns the ports used by the listeners if they came from validPorts.
 func (a *Applier) prepareGateway(t *testing.T, uObj *unstructured.Unstructured) {
+	// This locks serves as a critical section for the logic around manipulating
+	// ports and we enter it every time we prepare a Gateway.
 	a.portsLock.Lock()
 	defer a.portsLock.Unlock()
 
@@ -105,7 +109,8 @@ func (a *Applier) prepareGateway(t *testing.T, uObj *unstructured.Unstructured) 
 		Namespace: uObj.GetNamespace(),
 		Name:      uObj.GetName(),
 	}
-	// Mark the ports allocated to this Gateway as available
+	// Mark the ports allocated to this Gateway as available. We always rebuild
+	// the list of allocated ports, even if we've seen the Gateway before.
 	a.markPortsAvailable(name)
 
 	err := unstructured.SetNestedField(uObj.Object, a.GatewayClass, "spec", "gatewayClassName")
@@ -150,6 +155,7 @@ func (a *Applier) prepareGateway(t *testing.T, uObj *unstructured.Unstructured) 
 		require.NoErrorf(t, err, "error setting `spec.listeners` on %s Gateway resource", uObj.GetName())
 	}
 
+	// Remember the ports we've allocated for this Gateway resource.
 	a.assignedPorts[name] = allocatedPorts
 }
 
