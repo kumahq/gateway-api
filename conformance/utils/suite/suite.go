@@ -167,10 +167,10 @@ func New(s Options) *ConformanceTestSuite {
 		Debug:            s.Debug,
 		Cleanup:          s.CleanupBaseResources,
 		BaseManifests:    s.BaseManifests,
-		Applier: kubernetes.NewApplier(
-			s.NamespaceLabels,
-			s.ValidUniqueListenerPorts,
-		),
+		Applier: &kubernetes.Applier{
+			NamespaceLabels:          s.NamespaceLabels,
+			ValidUniqueListenerPorts: s.ValidUniqueListenerPorts,
+		},
 		SupportedFeatures: s.SupportedFeatures,
 		TimeoutConfig:     s.TimeoutConfig,
 		SkipTests:         sets.New(s.SkipTests...),
