@@ -1,3 +1,8 @@
+# Archived
+
+This repo held a fork of gateway-api for use with older branches of kuma. We now
+use the upstream package.
+
 # Kubernetes Gateway API
 
 The Gateway API is a part of [SIG Network][sn], and this repository contains
